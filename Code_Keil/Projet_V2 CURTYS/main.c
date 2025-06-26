@@ -11,14 +11,23 @@ extern ARM_DRIVER_USART Driver_USART1;
 void app_main(void const *argument);
 void USART1_Callback(uint32_t event);
 
+typedef struct{
+	char texte[8];
+} type_mailbox;
+
 osThreadDef(app_main, osPriorityNormal, 1, 0); // Définition de la tâche app_main
 osSemaphoreDef(rx_semaphore);                 // Définition du sémaphore pour la notification de message complet
 osSemaphoreId rx_semaphore_id;                // ID du sémaphore
+
+osMailQId ID_Mailbox_nom_touche;
+osMailQDef(Mailbox_nom_touche, 5, type_mailbox);
 
 #define RX_BUFFER_SIZE 32 // Taille maximale du message attendu (ex: "N:C#5\n")
 uint8_t rx_char;          // Caractère unique reçu
 char rx_buffer[RX_BUFFER_SIZE]; // Buffer pour stocker le message complet
 uint32_t rx_buffer_idx = 0;     // Index actuel dans le buffer de réception
+
+char *ptr;
 
 // --- Initialisation de l'USART ---
 void Init_USART1(void) {
@@ -45,14 +54,17 @@ void USART1_Callback(uint32_t event) {
         Driver_USART1.Send(&rx_char, 1);
 
         // Ajout du caractère au buffer de réception du message complet
-        if (rx_buffer_idx < (RX_BUFFER_SIZE - 1)) { // Évite le dépassement de buffer
-            rx_buffer[rx_buffer_idx++] = rx_char;
-        }
+        //if (rx_buffer_idx < (RX_BUFFER_SIZE - 1)) { // Évite le dépassement de buffer
+        //    rx_buffer[rx_buffer_idx++] = rx_char;
+        //}
 
+				ptr[rx_buffer_idx++] = rx_char;
         // Si le caractère reçu est une fin de ligne ('\n'), le message est complet.
         if (rx_char == '\n') {
-            rx_buffer[rx_buffer_idx] = '\0'; // Null-terminate la chaîne
-            osSemaphoreRelease(rx_semaphore_id); // Signaler à la tâche app_main qu'un message est prêt
+            ptr[--rx_buffer_idx] = '\0'; // Null-terminate la chaîne
+					
+						osMailPut(ID_Mailbox_nom_touche, ptr);
+            //osSemaphoreRelease(rx_semaphore_id); // Signaler à la tâche app_main qu'un message est prêt
             rx_buffer_idx = 0; // Réinitialiser l'index pour le prochain message
         }
         // Réarmer la réception pour le prochain caractère.
@@ -64,26 +76,35 @@ void USART1_Callback(uint32_t event) {
 void app_main(void const *argument) {
     char *note_name; // Déclaration
     size_t len;      // Déclaration
+	osEvent EVretour;
+	char *ptr_mail_recu;
+	
+		ptr = osMailAlloc(ID_Mailbox_nom_touche, osWaitForever);
 
     while (1) {
         // Attendre qu'un message complet soit reçu (sémaphore libéré par le callback)
-        osSemaphoreWait(rx_semaphore_id, osWaitForever);
+        //osSemaphoreWait(rx_semaphore_id, osWaitForever);
+				EVretour = osMailGet(ID_Mailbox_nom_touche, osWaitForever);
+				
+				ptr = osMailAlloc(ID_Mailbox_nom_touche, osWaitForever);
+			
+				ptr_mail_recu = EVretour.value.p;
 
         // === Message de debug: Affiche le message complet reçu sur le terminal ===
         Driver_USART1.Send((uint8_t*)"\nMessage complet recu: ", 23);
-        Driver_USART1.Send((uint8_t*)rx_buffer, strlen(rx_buffer));
+        Driver_USART1.Send((uint8_t*)ptr_mail_recu, strlen(ptr_mail_recu));
         Driver_USART1.Send((uint8_t*)"\n", 1);
 
         // --- Logique de traitement des messages Bluetooth ---
         // Exemple de message attendu : "N:C4\n" ou "F:C4\n"
 
-        note_name = &rx_buffer[2]; // Pointe après "N:" ou "F:"
+        note_name = &ptr_mail_recu[2]; // Pointe après "N:" ou "F:"
         len = strlen(note_name);
         if (len > 0 && note_name[len - 1] == '\n') { // Supprimer le '\n' si présent pour la comparaison
             note_name[len - 1] = '\0';
         }
 
-        if (strncmp(rx_buffer, "N:", 2) == 0) { // Si le message commence par "N:" (Note On)
+        if (strncmp(ptr_mail_recu, "N:", 2) == 0) { // Si le message commence par "N:" (Note On)
             if (strcmp(note_name, "C4") == 0) {
                 LED_On(0);
                 Driver_USART1.Send((uint8_t*)"LED0 ON (C4)\n", 13);
@@ -111,7 +132,7 @@ void app_main(void const *argument) {
             }
             // Vous pouvez ajouter d'autres notes si vous avez plus de LEDs ou si vous voulez remapper
             // Par exemple, si vous avez des notes comme C#4, D#4, etc.
-        } else if (strncmp(rx_buffer, "F:", 2) == 0) { // Si le message commence par "F:" (Note Off)
+        } else if (strncmp(ptr_mail_recu, "F:", 2) == 0) { // Si le message commence par "F:" (Note Off)
             if (strcmp(note_name, "C4") == 0) {
                 LED_Off(0);
                 Driver_USART1.Send((uint8_t*)"LED0 OFF (C4)\n", 14);
@@ -139,7 +160,8 @@ void app_main(void const *argument) {
             }
         }
         // Réinitialiser le buffer pour le prochain message après traitement
-        memset(rx_buffer, 0, RX_BUFFER_SIZE);
+        //memset(rx_buffer, 0, RX_BUFFER_SIZE);
+				osMailFree(ID_Mailbox_nom_touche, ptr_mail_recu);
     }
 }
 
@@ -147,10 +169,13 @@ void app_main(void const *argument) {
 int main(void) {
     LED_Initialize(); // Initialiser les LEDs
     // Créer le sémaphore initialisé à 0. Il sera libéré quand un message complet est reçu.
-    rx_semaphore_id = osSemaphoreCreate(osSemaphore(rx_semaphore), 0);
+    
     Init_USART1();    // Initialiser l'USART
 
     osKernelInitialize();           // Initialiser le noyau RTOS
+	//rx_semaphore_id = osSemaphoreCreate(osSemaphore(rx_semaphore), 0);
+	ID_Mailbox_nom_touche = osMailCreate(osMailQ(Mailbox_nom_touche), NULL);
+	
     osThreadCreate(osThread(app_main), NULL); // Créer la tâche principale
     osKernelStart();                // Lancer le scheduler RTOS
 
